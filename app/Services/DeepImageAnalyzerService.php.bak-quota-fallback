@@ -1,0 +1,632 @@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use RuntimeException;
+use Symfony\Component\Process\Process;
+
+class DeepImageAnalyzerService
+{
+    public function analyze(UploadedFile $image, array $context = []): array
+    {
+        $analysisId = (string) Str::uuid();
+
+        $sourcePath = $this->storeSourceImage($image, $analysisId);
+        $outputDir = storage_path("app/deep-ai/analysis/{$analysisId}");
+
+        if (!is_dir($outputDir)) {
+            mkdir($outputDir, 0775, true);
+        }
+
+        $layout = $this->runPythonAnalyzer($sourcePath, $outputDir);
+        $categories = $this->categories();
+
+        $tileAnalyses = [];
+        $tileErrors = [];
+
+        foreach (($layout['tiles'] ?? []) as $tile) {
+            if (!isset($tile['path']) || !is_file($tile['path'])) {
+                $tileErrors[] = [
+                    'tile_id' => $tile['tile_id'] ?? 'unknown',
+                    'error' => 'Tile file was not found.',
+                ];
+
+                continue;
+            }
+
+            try {
+                $tileAnalyses[] = $this->analyzeTileWithGemini(
+                    $tile,
+                    $categories,
+                    $context,
+                    $layout
+                );
+            } catch (\Throwable $exception) {
+                $tileErrors[] = [
+                    'tile_id' => $tile['tile_id'] ?? 'unknown',
+                    'error' => $exception->getMessage(),
+                ];
+            }
+        }
+
+        if (!count($tileAnalyses)) {
+            $firstError = $tileErrors[0]['error'] ?? 'No tile could be analyzed.';
+
+            throw new RuntimeException('All deep AI tile analyses failed. First error: ' . $firstError);
+        }
+
+        $components = $this->mergeComponents($tileAnalyses);
+        $summary = $this->buildSummary($components, $layout, $context);
+
+        return [
+            'category' => null,
+            'ai_result' => $summary,
+            'deep_analysis' => [
+                'analysis_id' => $analysisId,
+                'density' => $layout['density'] ?? null,
+                'tile_count' => count($layout['tiles'] ?? []),
+                'tiles_analyzed' => count($tileAnalyses),
+                'tiles_failed' => count($tileErrors),
+                'tile_errors' => $tileErrors,
+                'tile_analyses' => $tileAnalyses,
+            ],
+        ];
+    }
+
+    private function storeSourceImage(UploadedFile $image, string $analysisId): string
+    {
+        $extension = $image->getClientOriginalExtension() ?: 'jpg';
+        $fileName = "{$analysisId}.{$extension}";
+
+        $storedPath = $image->storeAs('deep-ai/source', $fileName, 'local');
+
+        if (!$storedPath) {
+            throw new RuntimeException('Failed to store image for deep analysis.');
+        }
+
+        $fullPath = Storage::disk('local')->path($storedPath);
+
+        if (!is_file($fullPath)) {
+            throw new RuntimeException('Stored image was not found at: ' . $fullPath);
+        }
+
+        return $fullPath;
+    }
+
+    private function runPythonAnalyzer(string $sourcePath, string $outputDir): array
+    {
+        $python = env('DEEP_AI_PYTHON_BIN', 'python3');
+        $script = base_path('python/deep_image_analyzer.py');
+
+        if (!is_file($script)) {
+            throw new RuntimeException('Python deep image analyzer script was not found.');
+        }
+
+        $process = new Process([
+            $python,
+            $script,
+            '--image',
+            $sourcePath,
+            '--output-dir',
+            $outputDir,
+            '--max-tiles',
+            (string) env('DEEP_AI_MAX_TILES', 9),
+            '--rows',
+            '3',
+            '--cols',
+            '3',
+        ]);
+
+        $process->setTimeout((int) env('DEEP_AI_PYTHON_TIMEOUT', 120));
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            throw new RuntimeException(
+                'Python deep image analyzer failed: ' . trim($process->getErrorOutput() ?: $process->getOutput())
+            );
+        }
+
+        $json = trim($process->getOutput());
+        $data = json_decode($json, true);
+
+        if (!is_array($data)) {
+            throw new RuntimeException('Python deep image analyzer returned invalid JSON.');
+        }
+
+        return $data;
+    }
+
+    private function analyzeTileWithGemini(
+        array $tile,
+        array $categories,
+        array $context,
+        array $layout
+    ): array {
+        $apiKey = env('GEMINI_API_KEY');
+
+        if (!$apiKey) {
+            throw new RuntimeException('GEMINI_API_KEY is missing.');
+        }
+
+        $model = env('GEMINI_MODEL', env('GEMINI_AI_MODEL', 'gemini-1.5-flash'));
+
+        $imagePath = (string) $tile['path'];
+        $mimeType = mime_content_type($imagePath) ?: 'image/jpeg';
+        $imageBase64 = base64_encode((string) file_get_contents($imagePath));
+
+        $categoriesJson = json_encode($categories, JSON_UNESCAPED_UNICODE);
+        $tileId = (string) ($tile['tile_id'] ?? 'tile');
+
+        $prompt = <<<PROMPT
+You are a strict deep computer vision analyzer for an e-waste recycling platform.
+
+You are analyzing one cropped section of a larger image.
+The full image may contain many overlapping small e-waste items.
+
+Return ONLY raw JSON.
+No markdown.
+No explanation outside JSON.
+
+Use exactly this JSON format:
+{
+  "tile_id": "{$tileId}",
+  "crop_description": "short description of what is visible in this crop",
+  "components": [
+    {
+      "item_name": "specific visible e-waste component name",
+      "category_id": null,
+      "category_name": "matched category or closest category",
+      "visible_quantity": 1,
+      "is_batch": false,
+      "unit_weight_kg": 0.5,
+      "total_weight_kg": 0.5,
+      "confidence": 85,
+      "false_estimation_probability": 15,
+      "visible_evidence": "what proves this item is visible",
+      "reason": "short reason"
+    }
+  ],
+  "crop_confidence": 80,
+  "notes": "short note"
+}
+
+STRICT RULES:
+- Identify every visible physical electronic/e-waste object or component in this crop.
+- Count only items visible in this crop.
+- Do not invent hidden items.
+- Name specific objects when possible: watch, small clock, soldering iron, torch, remote control, power adapter, charger, cable, joystick/game controller, speaker, electronic board, flashlight, router, phone, battery, plug, switch, small appliance part.
+- If many similar small items are tangled and cannot be counted, return a batch item such as "Cable batch" or "Mixed small electronic parts batch" with visible_quantity 1 and is_batch true.
+- Do not classify paper, fabric, text, logo, shadow, or background as e-waste.
+- If nothing useful is visible, return components [].
+- Be conservative with confidence if the item is partially hidden.
+- Do not force a high kg value.
+- Do not force 150kg.
+- Staff will verify final kg later using a scale.
+
+Reference unit weights:
+- Watch / small clock: 0.25 kg
+- Soldering iron / hand tool: 0.4 kg
+- Torch / flashlight: 0.45 kg
+- Remote control: 0.2 kg
+- Power adapter / charger: 0.3 kg
+- Cable batch: 5 kg
+- Single cable: 0.12 kg
+- Joystick / game controller: 0.35 kg
+- Small speaker component: 1 kg
+- Electronic board / circuit board: 0.2 kg
+- Phone: 0.2 kg
+- Tablet: 0.6 kg
+- Router / modem: 0.5 kg
+- Keyboard: 0.8 kg
+- Mouse: 0.2 kg
+- Mixed small electronic parts batch: 8 kg
+
+Available categories:
+{$categoriesJson}
+
+User context:
+Name: {$this->stringContext($context, 'name')}
+Title: {$this->stringContext($context, 'title')}
+Description: {$this->stringContext($context, 'description')}
+PROMPT;
+
+        $response = Http::timeout((int) env('DEEP_AI_GEMINI_TIMEOUT', 90))
+            ->post(
+                "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}",
+                [
+                    'contents' => [
+                        [
+                            'role' => 'user',
+                            'parts' => [
+                                ['text' => $prompt],
+                                [
+                                    'inline_data' => [
+                                        'mime_type' => $mimeType,
+                                        'data' => $imageBase64,
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                    'generationConfig' => [
+                        'temperature' => 0.05,
+                        'topP' => 0.8,
+                        'topK' => 20,
+                        'responseMimeType' => 'application/json',
+                    ],
+                ]
+            );
+
+        if (!$response->successful()) {
+            throw new RuntimeException(
+                'Gemini tile analysis failed: ' . $response->body()
+            );
+        }
+
+        $text = $response->json('candidates.0.content.parts.0.text');
+
+        if (!is_string($text) || trim($text) === '') {
+            throw new RuntimeException('Gemini tile analysis returned empty response.');
+        }
+
+        $parsed = $this->parseJson($text);
+
+        $parsed['tile_id'] = $tileId;
+        $parsed['tile_position'] = [
+            'row' => $tile['row'] ?? null,
+            'col' => $tile['col'] ?? null,
+            'box' => $tile['box'] ?? null,
+        ];
+
+        $parsed['components'] = $this->normalizeComponents($parsed['components'] ?? []);
+
+        return $parsed;
+    }
+
+    private function mergeComponents(array $tileAnalyses): array
+    {
+        $merged = [];
+
+        foreach ($tileAnalyses as $analysis) {
+            foreach (($analysis['components'] ?? []) as $component) {
+                $name = trim((string) ($component['item_name'] ?? ''));
+
+                if ($name === '') {
+                    continue;
+                }
+
+                $key = $this->normalizeName($name);
+                $quantity = max(1, (int) ($component['visible_quantity'] ?? 1));
+                $unitWeight = (float) ($component['unit_weight_kg'] ?? 0);
+
+                if ($unitWeight <= 0) {
+                    $unitWeight = $this->referenceWeight($name);
+                }
+
+                $totalWeight = (float) ($component['total_weight_kg'] ?? 0);
+
+                if ($totalWeight <= 0) {
+                    $totalWeight = $unitWeight * $quantity;
+                }
+
+                if (!isset($merged[$key])) {
+                    $merged[$key] = [
+                        'item_name' => $this->cleanItemName($name),
+                        'category_id' => $component['category_id'] ?? null,
+                        'category_name' => $component['category_name'] ?? null,
+                        'visible_quantity' => 0,
+                        'quantity' => 0,
+                        'is_batch' => (bool) ($component['is_batch'] ?? false),
+                        'unit_weight_kg' => round($unitWeight, 2),
+                        'total_weight_kg' => 0,
+                        'confidence_values' => [],
+                        'false_estimation_values' => [],
+                        'visible_evidence' => [],
+                        'reason' => [],
+                    ];
+                }
+
+                $merged[$key]['visible_quantity'] += $quantity;
+                $merged[$key]['quantity'] += $quantity;
+                $merged[$key]['total_weight_kg'] += $totalWeight;
+                $merged[$key]['confidence_values'][] = (float) ($component['confidence'] ?? 70);
+                $merged[$key]['false_estimation_values'][] = (float) ($component['false_estimation_probability'] ?? 30);
+
+                if (!empty($component['visible_evidence'])) {
+                    $merged[$key]['visible_evidence'][] = (string) $component['visible_evidence'];
+                }
+
+                if (!empty($component['reason'])) {
+                    $merged[$key]['reason'][] = (string) $component['reason'];
+                }
+            }
+        }
+
+        return collect($merged)
+            ->map(function (array $item) {
+                $confidence = $this->average($item['confidence_values']);
+                $falseProbability = $this->average($item['false_estimation_values']);
+
+                return [
+                    'item_name' => $item['item_name'],
+                    'category_id' => $item['category_id'],
+                    'category_name' => $item['category_name'],
+                    'quantity' => $item['quantity'],
+                    'visible_quantity' => $item['visible_quantity'],
+                    'is_batch' => $item['is_batch'],
+                    'unit_weight_kg' => round((float) $item['unit_weight_kg'], 2),
+                    'total_weight_kg' => round((float) $item['total_weight_kg'], 2),
+                    'confidence' => round($confidence, 2),
+                    'false_estimation_probability' => round($falseProbability, 2),
+                    'visible_evidence' => implode(' | ', array_slice(array_unique($item['visible_evidence']), 0, 4)),
+                    'reason' => implode(' | ', array_slice(array_unique($item['reason']), 0, 4)),
+                ];
+            })
+            ->sortByDesc('total_weight_kg')
+            ->values()
+            ->all();
+    }
+
+    private function buildSummary(array $components, array $layout, array $context): array
+    {
+        $density = $layout['density'] ?? [];
+        $densityScore = (float) ($density['density_score'] ?? 0);
+        $isDense = (bool) ($density['is_dense'] ?? false);
+
+        $quantity = collect($components)->sum(fn ($item) => (int) ($item['quantity'] ?? 0));
+        $visibleWeight = collect($components)->sum(fn ($item) => (float) ($item['total_weight_kg'] ?? 0));
+
+        if ($quantity >= 18 || $densityScore >= 55) {
+            $isDense = true;
+        }
+
+        $averageConfidence = $components
+            ? collect($components)->avg(fn ($item) => (float) ($item['confidence'] ?? 60))
+            : 0;
+
+        if ($isDense) {
+            $minWeight = max($visibleWeight * 1.6, $visibleWeight + 10);
+            $maxWeight = max($minWeight + 15, $visibleWeight * 3.0);
+            $suggestedWeight = ($minWeight + $maxWeight) / 2;
+            $confidence = min(70, max(45, $averageConfidence ?: 55));
+            $falseProbability = min(55, max(30, 100 - $confidence + 10));
+            $quotationMode = 'range_only';
+            $reliability = 'low';
+            $loadType = 'mixed_dense_pile';
+            $requiresStaffVerification = true;
+        } else {
+            $minWeight = $visibleWeight;
+            $maxWeight = $visibleWeight;
+            $suggestedWeight = $visibleWeight;
+            $confidence = min(95, max(60, $averageConfidence ?: 75));
+            $falseProbability = max(5, 100 - $confidence);
+            $quotationMode = 'estimate';
+            $reliability = 'medium';
+            $loadType = 'visible_items';
+            $requiresStaffVerification = true;
+        }
+
+        $rate = (float) env('E_WASTE_DEFAULT_PRICE_PER_KG', 700);
+
+        $priceMin = round($minWeight * $rate);
+        $priceMax = round($maxWeight * $rate);
+        $suggestedPrice = round($suggestedWeight * $rate);
+
+        $itemNames = collect($components)
+            ->pluck('item_name')
+            ->filter()
+            ->take(12)
+            ->implode(', ');
+
+        return [
+            'detected_item' => $itemNames ?: 'No visible e-waste components detected',
+            'title' => $context['title'] ?? ($isDense ? 'Mixed Dense Electronic Waste Collection' : 'Visible Electronic Waste Collection'),
+            'description' => $this->buildDescription($components, $isDense),
+            'detected_category_id' => null,
+            'detected_category_name' => $isDense ? 'Mixed E-Waste' : ($components[0]['category_name'] ?? null),
+            'waste_nature' => 'ibitabora',
+            'is_e_waste' => count($components) > 0,
+            'is_hazardous' => false,
+            'quantity' => $quantity,
+            'estimated_weight_kg' => round($suggestedWeight, 2),
+            'estimated_weight_min_kg' => round($minWeight, 2),
+            'estimated_weight_max_kg' => round($maxWeight, 2),
+            'expected_price' => $suggestedPrice,
+            'expected_price_min' => $priceMin,
+            'expected_price_max' => $priceMax,
+            'price_per_kg' => $rate,
+            'currency' => 'RWF',
+            'confidence' => round($confidence, 2),
+            'false_estimation_probability' => round($falseProbability, 2),
+            'condition' => 'used',
+            'load_type' => $loadType,
+            'quotation_mode' => $quotationMode,
+            'visual_count_reliability' => $reliability,
+            'requires_staff_verification' => $requiresStaffVerification,
+            'density_score' => round($densityScore, 2),
+            'item_breakdown' => $components,
+            'analysis_note' => $isDense
+                ? 'Dense mixed pile detected. Many items overlap or are partially hidden. This is a provisional range only; final kg and price must be confirmed by staff weighing.'
+                : 'Visible items detected. This is still provisional until staff verification.',
+        ];
+    }
+
+    private function buildDescription(array $components, bool $isDense): string
+    {
+        if (!$components) {
+            return 'No clear physical e-waste components were detected.';
+        }
+
+        $names = collect($components)
+            ->map(fn ($item) => "{$item['quantity']} × {$item['item_name']}")
+            ->take(15)
+            ->implode(', ');
+
+        if ($isDense) {
+            return "Dense mixed e-waste pile with visible components including {$names}. Many items are overlapping, so the final weight must be confirmed by scale.";
+        }
+
+        return "Visible e-waste components include {$names}.";
+    }
+
+    private function normalizeComponents(array $components): array
+    {
+        return collect($components)
+            ->filter(fn ($item) => is_array($item) && trim((string) ($item['item_name'] ?? '')) !== '')
+            ->map(function (array $item) {
+                $name = $this->cleanItemName((string) ($item['item_name'] ?? 'Unknown item'));
+                $quantity = max(1, (int) ($item['visible_quantity'] ?? $item['quantity'] ?? 1));
+                $unitWeight = (float) ($item['unit_weight_kg'] ?? 0);
+
+                if ($unitWeight <= 0) {
+                    $unitWeight = $this->referenceWeight($name);
+                }
+
+                $totalWeight = (float) ($item['total_weight_kg'] ?? 0);
+
+                if ($totalWeight <= 0) {
+                    $totalWeight = $unitWeight * $quantity;
+                }
+
+                $confidence = min(max((float) ($item['confidence'] ?? 70), 0), 100);
+
+                return [
+                    'item_name' => $name,
+                    'category_id' => $item['category_id'] ?? null,
+                    'category_name' => $item['category_name'] ?? null,
+                    'visible_quantity' => $quantity,
+                    'is_batch' => (bool) ($item['is_batch'] ?? str_contains(strtolower($name), 'batch')),
+                    'unit_weight_kg' => round($unitWeight, 2),
+                    'total_weight_kg' => round($totalWeight, 2),
+                    'confidence' => $confidence,
+                    'false_estimation_probability' => min(
+                        max((float) ($item['false_estimation_probability'] ?? (100 - $confidence)), 0),
+                        100
+                    ),
+                    'visible_evidence' => (string) ($item['visible_evidence'] ?? ''),
+                    'reason' => (string) ($item['reason'] ?? ''),
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    private function categories(): array
+    {
+        if (!Schema::hasTable('waste_categories')) {
+            return [];
+        }
+
+        $columns = Schema::getColumnListing('waste_categories');
+
+        $select = array_values(array_intersect([
+            'id',
+            'name',
+            'slug',
+            'price_per_kg',
+            'price_per_item',
+            'average_weight_kg',
+            'waste_nature',
+        ], $columns));
+
+        return DB::table('waste_categories')
+            ->select($select ?: ['id', 'name'])
+            ->limit(200)
+            ->get()
+            ->map(fn ($row) => (array) $row)
+            ->values()
+            ->all();
+    }
+
+    private function parseJson(string $text): array
+    {
+        $clean = trim($text);
+        $clean = preg_replace('/^```json\s*/i', '', $clean);
+        $clean = preg_replace('/^```\s*/', '', $clean);
+        $clean = preg_replace('/\s*```$/', '', $clean);
+
+        $data = json_decode($clean, true);
+
+        if (is_array($data)) {
+            return $data;
+        }
+
+        if (preg_match('/\{.*\}/s', $clean, $matches)) {
+            $data = json_decode($matches[0], true);
+
+            if (is_array($data)) {
+                return $data;
+            }
+        }
+
+        throw new RuntimeException('Gemini returned invalid JSON for tile analysis.');
+    }
+
+    private function referenceWeight(string $name): float
+    {
+        $name = strtolower($name);
+
+        return match (true) {
+            str_contains($name, 'watch') || str_contains($name, 'clock') => 0.25,
+            str_contains($name, 'solder') => 0.4,
+            str_contains($name, 'torch') || str_contains($name, 'flashlight') => 0.45,
+            str_contains($name, 'remote') => 0.2,
+            str_contains($name, 'adapter') || str_contains($name, 'charger') => 0.3,
+            str_contains($name, 'cable batch') || str_contains($name, 'wire batch') => 5.0,
+            str_contains($name, 'cable') || str_contains($name, 'wire') => 0.12,
+            str_contains($name, 'joystick') || str_contains($name, 'game controller') => 0.35,
+            str_contains($name, 'speaker') => 1.0,
+            str_contains($name, 'board') || str_contains($name, 'circuit') || str_contains($name, 'pcb') => 0.2,
+            str_contains($name, 'phone') => 0.2,
+            str_contains($name, 'tablet') => 0.6,
+            str_contains($name, 'router') || str_contains($name, 'modem') => 0.5,
+            str_contains($name, 'keyboard') => 0.8,
+            str_contains($name, 'mouse') => 0.2,
+            str_contains($name, 'printer') => 8.0,
+            str_contains($name, 'laptop') => 2.5,
+            str_contains($name, 'monitor') => 4.0,
+            str_contains($name, 'battery') => 1.2,
+            str_contains($name, 'batch') => 8.0,
+            default => 0.5,
+        };
+    }
+
+    private function cleanItemName(string $name): string
+    {
+        $name = trim(preg_replace('/\s+/', ' ', $name) ?: $name);
+
+        return Str::title($name);
+    }
+
+    private function normalizeName(string $name): string
+    {
+        $name = strtolower($name);
+        $name = str_replace(['/', '-', '_'], ' ', $name);
+        $name = preg_replace('/\b(small|visible|electronic|e waste|ewaste|component|components|device|devices)\b/', '', $name);
+        $name = preg_replace('/\s+/', ' ', $name);
+
+        return trim($name ?: strtolower($name));
+    }
+
+    private function average(array $values): float
+    {
+        $values = array_values(array_filter($values, fn ($value) => is_numeric($value)));
+
+        if (!$values) {
+            return 0;
+        }
+
+        return array_sum($values) / count($values);
+    }
+
+    private function stringContext(array $context, string $key): string
+    {
+        return trim((string) ($context[$key] ?? '-')) ?: '-';
+    }
+}

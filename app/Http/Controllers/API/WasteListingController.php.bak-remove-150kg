@@ -1,0 +1,1535 @@
+<?php
+
+namespace App\Http\Controllers\API;
+
+use App\Http\Controllers\API\BaseController as BaseController;
+use App\Models\User;
+use App\Models\WasteAiAnalysis;
+use App\Models\WasteCategory;
+use App\Models\WasteListing;
+use App\Models\WastePhoto;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
+
+class WasteListingController extends BaseController
+{
+    private function isAdmin(User $user): bool
+    {
+        return $user->role === 'admin';
+    }
+
+    private function isStaff(User $user): bool
+    {
+        return in_array($user->role, ['enviroserve_staff', 'admin'], true);
+    }
+
+    private function canView(User $user, WasteListing $listing): bool
+    {
+        return $this->isStaff($user) || $listing->institution_id === $user->id;
+    }
+
+    public function index(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $query = WasteListing::with([
+            'institution:id,name,email,role,institution_name,phone',
+            'category',
+            'primaryPhoto',
+            'latestPickup',
+        ]);
+
+        if ($user->role === 'institution') {
+            $query->where('institution_id', $user->id);
+        }
+
+        if ($request->filled('status') && $request->status !== 'all') {
+            $query->where('status', $request->status);
+        }
+
+        if ($request->filled('waste_category_id') && $request->waste_category_id !== 'all') {
+            $query->where('waste_category_id', $request->waste_category_id);
+        }
+
+        if ($request->filled('district')) {
+            $query->where('district', $request->district);
+        }
+
+        if ($request->filled('search')) {
+            $search = trim((string) $request->input('search'));
+
+            $query->where(function ($q) use ($search) {
+                $q->where('title', 'like', "%{$search}%")
+                    ->orWhere('description', 'like', "%{$search}%")
+                    ->orWhere('ai_detected_item', 'like', "%{$search}%")
+                    ->orWhere('ai_detected_category', 'like', "%{$search}%");
+            });
+        }
+
+        $perPage = (int) $request->input('per_page', 15);
+        $perPage = max(5, min($perPage, 100));
+
+        $listings = $query->latest()->paginate($perPage);
+
+        return $this->sendResponse($listings, 'Waste listings retrieved successfully.');
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $allowedListingRoles = [
+            'customer',
+            'company',
+            'institution',
+            'organization',
+            'client',
+            'admin',
+        ];
+
+        if (!in_array($user->role, $allowedListingRoles, true)) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'Only customer, company, institution, organization, client or admin can upload waste.'],
+                403
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'institution_id' => ['nullable', 'exists:users,id'],
+            'waste_category_id' => ['nullable', 'exists:waste_categories,id'],
+            'title' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+            'quantity' => ['nullable', 'integer', 'min:1'],
+            'estimated_weight_kg' => ['nullable', 'numeric', 'min:0'],
+            'expected_price' => ['nullable', 'numeric', 'min:0'],
+            'currency' => ['nullable', 'string', 'max:10'],
+            'pickup_address' => ['nullable', 'string'],
+            'district' => ['nullable', 'string', 'max:100'],
+            'sector' => ['nullable', 'string', 'max:100'],
+            'cell' => ['nullable', 'string', 'max:100'],
+            'village' => ['nullable', 'string', 'max:100'],
+            'latitude' => ['nullable', 'numeric'],
+            'longitude' => ['nullable', 'numeric'],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendError('Validation Error.', $validator->errors(), 422);
+        }
+
+        $quantity = max((int) $request->input('quantity', 1), 1);
+        $category = null;
+        $estimatedWeight = $this->numberOrNull($request->input('estimated_weight_kg'));
+        $expectedPrice = $this->numberOrNull($request->input('expected_price'));
+
+        if ($request->filled('waste_category_id')) {
+            $category = WasteCategory::find($request->input('waste_category_id'));
+
+            if (!$estimatedWeight && $category && $category->average_weight_kg) {
+                $estimatedWeight = $quantity * (float) $category->average_weight_kg;
+            }
+
+            if (!$expectedPrice && $category) {
+                $expectedPrice = $this->calculateExpectedPrice(
+                    $category,
+                    $quantity,
+                    $estimatedWeight,
+                    'single_item'
+                );
+            }
+        }
+
+        $listing = WasteListing::create([
+            'institution_id' => $user->role === 'admin'
+                ? $request->input('institution_id', $user->id)
+                : $user->id,
+
+            'waste_category_id' => $request->input('waste_category_id'),
+            'title' => $request->input('title'),
+            'description' => $request->input('description'),
+            'quantity' => $quantity,
+            'estimated_weight_kg' => $estimatedWeight,
+            'expected_price' => $expectedPrice,
+            'currency' => $request->input('currency', 'RWF'),
+
+            'pickup_address' => $request->input('pickup_address'),
+            'district' => $request->input('district'),
+            'sector' => $request->input('sector'),
+            'cell' => $request->input('cell'),
+            'village' => $request->input('village'),
+            'latitude' => $request->input('latitude'),
+            'longitude' => $request->input('longitude'),
+
+            'status' => 'pending',
+        ]);
+
+        return $this->sendResponse(
+            $listing->load(['institution:id,name,email,role,institution_name', 'category']),
+            'Waste listing created successfully.'
+        );
+    }
+
+    public function aiPreview(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $allowedListingRoles = [
+            'customer',
+            'company',
+            'institution',
+            'organization',
+            'client',
+            'admin',
+        ];
+
+        if (!in_array($user->role, $allowedListingRoles, true)) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'Only customer, company, institution, organization, client or admin can analyze waste listing.'],
+                403
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'name' => ['nullable', 'string', 'max:255'],
+            'title' => ['nullable', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+            'quantity' => ['nullable', 'integer', 'min:1'],
+            'waste_category_id' => ['nullable', 'exists:waste_categories,id'],
+            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendError('Validation Error.', $validator->errors(), 422);
+        }
+
+        if (!$request->filled('name') && !$request->filled('title') && !$request->hasFile('image')) {
+            return $this->sendError(
+                'Missing input.',
+                ['error' => 'Type item name/title or upload an image.'],
+                422
+            );
+        }
+
+        try {
+            $prepared = $this->prepareAiListingData($request);
+        } catch (\RuntimeException $exception) {
+            return $this->sendError(
+                'AI image analysis failed.',
+                [
+                    'error' => $exception->getMessage(),
+                    'fix' => 'Check GEMINI_USE_AI=true, GEMINI_API_KEY, internet connection, and Gemini model name.',
+                ],
+                422
+            );
+        }
+
+        return $this->sendResponse($prepared, 'AI listing preview generated successfully.');
+    }
+
+    public function aiCreate(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $allowedListingRoles = [
+            'customer',
+            'company',
+            'institution',
+            'organization',
+            'client',
+            'admin',
+        ];
+
+        if (!in_array($user->role, $allowedListingRoles, true)) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'Only customer, company, institution or admin can create AI waste listing.'],
+                403
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'institution_id' => ['nullable', 'exists:users,id'],
+
+            'name' => ['nullable', 'string', 'max:255'],
+            'title' => ['nullable', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+            'quantity' => ['nullable', 'integer', 'min:1'],
+            'waste_category_id' => ['nullable', 'exists:waste_categories,id'],
+
+            'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:5120'],
+            'photo_type' => ['nullable', Rule::in([
+                'main',
+                'front',
+                'back',
+                'side',
+                'serial_number',
+                'damage',
+                'other',
+            ])],
+
+            'pickup_address' => ['nullable', 'string'],
+            'district' => ['nullable', 'string', 'max:100'],
+            'sector' => ['nullable', 'string', 'max:100'],
+            'cell' => ['nullable', 'string', 'max:100'],
+            'village' => ['nullable', 'string', 'max:100'],
+            'latitude' => ['nullable', 'numeric'],
+            'longitude' => ['nullable', 'numeric'],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendError('Validation Error.', $validator->errors(), 422);
+        }
+
+        if (!$request->filled('name') && !$request->filled('title') && !$request->hasFile('image')) {
+            return $this->sendError(
+                'Missing input.',
+                ['error' => 'Type item name/title or upload an image.'],
+                422
+            );
+        }
+
+        try {
+            $prepared = $this->prepareAiListingData($request);
+        } catch (\RuntimeException $exception) {
+            return $this->sendError(
+                'AI image analysis failed.',
+                [
+                    'error' => $exception->getMessage(),
+                    'fix' => 'Check GEMINI_USE_AI=true, GEMINI_API_KEY, internet connection, and Gemini model name.',
+                ],
+                422
+            );
+        }
+
+        $category = $prepared['category'];
+        $ai = $prepared['ai_result'];
+
+        if ($this->isNoWasteAnalysis($ai)) {
+            return $this->sendError(
+                'No e-waste detected.',
+                [
+                    'error' => 'The uploaded image does not contain visible e-waste items. Listing was not created.',
+                    'ai_result' => $ai,
+                ],
+                422
+            );
+        }
+
+        $result = DB::transaction(function () use ($request, $user, $category, $ai) {
+            $quantity = max((int) ($ai['quantity'] ?? $request->input('quantity', 1)), 1);
+            $estimatedWeight = $this->numberOrNull($ai['estimated_weight_kg'] ?? null);
+            $expectedPrice = $this->numberOrNull($ai['expected_price'] ?? null);
+
+            $listing = WasteListing::create([
+                'institution_id' => $user->role === 'admin'
+                    ? $request->input('institution_id', $user->id)
+                    : $user->id,
+
+                'waste_category_id' => $category?->id,
+
+                'title' => (string) (
+                    $ai['title']
+                    ?? $ai['detected_item']
+                    ?? $request->input('title')
+                    ?? $request->input('name')
+                    ?? 'E-Waste Listing'
+                ),
+
+                'description' => (string) (
+                    $request->input('description')
+                    ?: ($ai['description'] ?? $ai['analysis_note'] ?? null)
+                ),
+
+                'quantity' => $quantity,
+                'estimated_weight_kg' => $estimatedWeight,
+                'expected_price' => $expectedPrice,
+                'currency' => 'RWF',
+
+                'pickup_address' => $request->input('pickup_address'),
+                'district' => $request->input('district'),
+                'sector' => $request->input('sector'),
+                'cell' => $request->input('cell'),
+                'village' => $request->input('village'),
+                'latitude' => $request->input('latitude'),
+                'longitude' => $request->input('longitude'),
+
+                'ai_detected_item' => $ai['detected_item'] ?? null,
+                'ai_detected_category' => $category?->name ?? ($ai['detected_category_name'] ?? null),
+                'ai_waste_nature' => $category?->waste_nature ?? ($ai['waste_nature'] ?? null),
+                'ai_is_e_waste' => (bool) ($ai['is_e_waste'] ?? true),
+                'ai_estimated_weight_kg' => $estimatedWeight,
+                'ai_confidence' => $this->numberOrNull($ai['confidence'] ?? 70),
+                'ai_analysis_note' => $ai['analysis_note'] ?? null,
+
+                'status' => 'ai_analyzed',
+            ]);
+
+            $photo = null;
+
+            if ($request->hasFile('image')) {
+                $file = $request->file('image');
+                $path = $file->store('waste_photos', 'public');
+
+                WastePhoto::where('waste_listing_id', $listing->id)->update([
+                    'is_primary' => false,
+                ]);
+
+                $photo = WastePhoto::create([
+                    'waste_listing_id' => $listing->id,
+                    'uploaded_by' => $user->id,
+                    'photo_path' => $path,
+                    'original_name' => $file->getClientOriginalName(),
+                    'mime_type' => $file->getMimeType(),
+                    'file_size' => $file->getSize(),
+                    'storage_disk' => 'public',
+                    'photo_type' => $request->input('photo_type', 'main'),
+                    'is_primary' => true,
+                    'sort_order' => 0,
+                    'is_ai_processed' => true,
+                    'ai_processed_at' => now(),
+                    'status' => 'active',
+                ]);
+            }
+
+            $analysis = WasteAiAnalysis::create([
+                'waste_listing_id' => $listing->id,
+                'waste_photo_id' => $photo?->id,
+                'ai_provider' => 'gemini',
+                'ai_model' => $this->getGeminiModel(),
+
+                'detected_item' => $ai['detected_item'] ?? $listing->title,
+                'detected_category_id' => $category?->id,
+                'detected_category_name' => $category?->name ?? ($ai['detected_category_name'] ?? null),
+
+                'waste_nature' => $category?->waste_nature ?? ($ai['waste_nature'] ?? null),
+                'is_e_waste' => (bool) ($ai['is_e_waste'] ?? true),
+                'is_hazardous' => (bool) ($category?->is_hazardous ?? ($ai['is_hazardous'] ?? false)),
+
+                'quantity_detected' => $quantity,
+                'estimated_weight_kg' => $estimatedWeight,
+                'min_estimated_weight_kg' => $category?->min_weight_kg,
+                'max_estimated_weight_kg' => $category?->max_weight_kg,
+                'confidence' => $this->numberOrNull($ai['confidence'] ?? 70),
+
+                'analysis_note' => $ai['analysis_note'] ?? null,
+                'analysis_result' => $ai,
+
+                'status' => 'completed',
+                'analyzed_at' => now(),
+            ]);
+
+            return [
+                'listing' => $listing->fresh()->load([
+                    'institution:id,name,email,role,institution_name,phone',
+                    'category',
+                    'primaryPhoto',
+                    'aiAnalyses',
+                ]),
+                'photo' => $photo,
+                'analysis' => $analysis->fresh()->load(['detectedCategory']),
+                'ai_result' => $ai,
+            ];
+        });
+
+        return $this->sendResponse($result, 'AI waste listing created successfully.');
+    }
+
+    public function show(Request $request, WasteListing $wasteListing): JsonResponse
+    {
+        if (!$this->canView($request->user(), $wasteListing)) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'You cannot view this waste listing.'],
+                403
+            );
+        }
+
+        $wasteListing->load([
+            'institution:id,name,email,role,institution_name,phone',
+            'category',
+            'photos',
+            'aiAnalyses',
+            'verifications',
+            'offers',
+            'pickups',
+            'qrTags',
+        ]);
+
+        return $this->sendResponse($wasteListing, 'Waste listing retrieved successfully.');
+    }
+
+    public function update(Request $request, WasteListing $wasteListing): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$this->isAdmin($user) && $wasteListing->institution_id !== $user->id) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'You cannot update this listing.'],
+                403
+            );
+        }
+
+        if (!$this->isAdmin($user) && !in_array($wasteListing->status, ['pending', 'rejected', 'cancelled'], true)) {
+            return $this->sendError(
+                'Update denied.',
+                ['error' => 'You can only update pending, rejected, or cancelled listings.'],
+                403
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'waste_category_id' => ['nullable', 'exists:waste_categories,id'],
+            'title' => ['sometimes', 'required', 'string', 'max:255'],
+            'description' => ['nullable', 'string'],
+            'quantity' => ['nullable', 'integer', 'min:1'],
+            'estimated_weight_kg' => ['nullable', 'numeric', 'min:0'],
+            'expected_price' => ['nullable', 'numeric', 'min:0'],
+            'pickup_address' => ['nullable', 'string'],
+            'district' => ['nullable', 'string', 'max:100'],
+            'sector' => ['nullable', 'string', 'max:100'],
+            'cell' => ['nullable', 'string', 'max:100'],
+            'village' => ['nullable', 'string', 'max:100'],
+            'latitude' => ['nullable', 'numeric'],
+            'longitude' => ['nullable', 'numeric'],
+            'status' => ['nullable', Rule::in([
+                'pending',
+                'ai_analyzed',
+                'verified',
+                'offer_sent',
+                'offer_accepted',
+                'pickup_scheduled',
+                'collected',
+                'completed',
+                'rejected',
+                'cancelled',
+            ])],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendError('Validation Error.', $validator->errors(), 422);
+        }
+
+        $wasteListing->update($request->only([
+            'waste_category_id',
+            'title',
+            'description',
+            'quantity',
+            'estimated_weight_kg',
+            'expected_price',
+            'pickup_address',
+            'district',
+            'sector',
+            'cell',
+            'village',
+            'latitude',
+            'longitude',
+            'status',
+        ]));
+
+        return $this->sendResponse(
+            $wasteListing->fresh()->load(['institution:id,name,email,role,institution_name', 'category']),
+            'Waste listing updated successfully.'
+        );
+    }
+
+    public function destroy(Request $request, WasteListing $wasteListing): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$this->isAdmin($user) && $wasteListing->institution_id !== $user->id) {
+            return $this->sendError(
+                'Access denied.',
+                ['error' => 'You cannot delete this listing.'],
+                403
+            );
+        }
+
+        if (!$this->isAdmin($user) && $wasteListing->status !== 'pending') {
+            return $this->sendError(
+                'Delete denied.',
+                ['error' => 'Only pending listings can be deleted.'],
+                403
+            );
+        }
+
+        $wasteListing->delete();
+
+        return $this->sendResponse([], 'Waste listing deleted successfully.');
+    }
+
+    private function prepareAiListingData(Request $request): array
+    {
+        $categories = WasteCategory::query()
+            ->where('status', 'active')
+            ->get();
+
+        $analysis = $this->generateGeminiListingAnalysis($request, $categories);
+
+        if (!is_array($analysis)) {
+            if ($request->hasFile('image')) {
+                throw new \RuntimeException(
+                    'Gemini did not return a valid image analysis. The system refused to use fake fallback rows for this image.'
+                );
+            }
+
+            $analysis = $this->fallbackListingAnalysis(
+                (string) ($request->input('name') ?: $request->input('title') ?: ''),
+                false
+            );
+        }
+
+        if ($this->isNoWasteAnalysis($analysis)) {
+            $analysis['detected_item'] = $analysis['detected_item'] ?? 'No e-waste detected';
+            $analysis['title'] = $analysis['title'] ?? 'No E-Waste Detected in Image';
+            $analysis['description'] = $analysis['description'] ?? 'No visible e-waste items were detected in the uploaded image.';
+            $analysis['detected_category_id'] = null;
+            $analysis['detected_category_name'] = null;
+            $analysis['waste_nature'] = 'ibitabora';
+            $analysis['is_e_waste'] = false;
+            $analysis['is_hazardous'] = false;
+            $analysis['quantity'] = 0;
+            $analysis['estimated_weight_kg'] = 0;
+            $analysis['expected_price'] = 0;
+            $analysis['currency'] = 'RWF';
+            $analysis['confidence'] = $analysis['confidence'] ?? 80;
+            $analysis['condition'] = 'not_applicable';
+            $analysis['load_type'] = 'no_waste';
+            $analysis['item_breakdown'] = [];
+            $analysis['analysis_note'] = $analysis['analysis_note']
+                ?? 'No e-waste items were detected in the uploaded image. Listing should not be created.';
+
+            return [
+                'category' => null,
+                'ai_result' => $this->sanitizeAiResult($analysis),
+            ];
+        }
+
+        $loadType = $this->detectLoadType($analysis, $request);
+        $analysis['load_type'] = $loadType;
+
+        $itemBreakdown = $this->normalizeItemBreakdownFromCategories($analysis, $categories);
+
+        if (!count($itemBreakdown)) {
+            $itemBreakdown = $this->fallbackBreakdownFromCategories($analysis, $categories, $loadType, $request->hasFile('image'));
+        }
+
+        $breakdownWeight = $this->sumBreakdownWeight($itemBreakdown);
+        $breakdownPrice = $this->sumBreakdownPrice($itemBreakdown);
+
+        if ($loadType === 'bulk_pile' && $breakdownWeight > 0 && $breakdownWeight < 50) {
+            $bulkCategory = $this->findBulkCategory($categories);
+            $missingWeight = 150 - $breakdownWeight;
+
+            if ($missingWeight > 0) {
+                $unitPrice = $this->numberOrNull($bulkCategory?->price_per_kg) ?: 700;
+
+                $itemBreakdown[] = [
+                    'item_name' => 'Uncounted mixed e-waste batch',
+                    'category_id' => $bulkCategory?->id,
+                    'category_name' => $bulkCategory?->name ?? 'Mixed E-Waste',
+                    'category_slug' => $bulkCategory?->slug ?? 'mixed_e_waste_bulk_pile',
+                    'quantity' => 1,
+                    'unit_weight_kg' => round($missingWeight, 2),
+                    'total_weight_kg' => round($missingWeight, 2),
+                    'price_per_kg' => $unitPrice,
+                    'price_per_item' => 0,
+                    'line_expected_price' => round($missingWeight * $unitPrice, 2),
+                    'confidence' => 55,
+                    'reason' => 'Added because a bulk pile cannot realistically weigh below 50 kg. Staff verification required.',
+                ];
+            }
+
+            $breakdownWeight = $this->sumBreakdownWeight($itemBreakdown);
+            $breakdownPrice = $this->sumBreakdownPrice($itemBreakdown);
+        }
+
+        $category = $this->selectListingCategory($request, $analysis, $itemBreakdown, $categories);
+
+        $quantity = (int) ($request->input('quantity') ?: ($analysis['quantity'] ?? 1));
+        $quantity = max($quantity, 1);
+
+        $estimatedWeight = $breakdownWeight > 0
+            ? $breakdownWeight
+            : $this->numberOrNull($analysis['estimated_weight_kg'] ?? null);
+
+        if ($loadType === 'bulk_pile' && (!$estimatedWeight || $estimatedWeight < 50)) {
+            $estimatedWeight = 150;
+        }
+
+        if (!$estimatedWeight && $category && $category->average_weight_kg) {
+            $estimatedWeight = $quantity * (float) $category->average_weight_kg;
+        }
+
+        if (!$estimatedWeight) {
+            $estimatedWeight = $loadType === 'bulk_pile'
+                ? 150
+                : ($quantity * 1);
+        }
+
+        $expectedPrice = $breakdownPrice > 0
+            ? $breakdownPrice
+            : (
+                $category
+                    ? $this->calculateExpectedPrice($category, $quantity, $estimatedWeight, $loadType)
+                    : $this->numberOrNull($analysis['expected_price'] ?? null)
+            );
+
+        if (!$expectedPrice) {
+            $expectedPrice = $loadType === 'bulk_pile'
+                ? ((float) $estimatedWeight * 700)
+                : ($quantity * 1500);
+        }
+
+        $detectedNames = collect($itemBreakdown)
+            ->map(fn ($item) => $item['item_name'] ?? null)
+            ->filter()
+            ->take(6)
+            ->implode(', ');
+
+        $analysis['quantity'] = $quantity;
+        $analysis['estimated_weight_kg'] = round((float) $estimatedWeight, 2);
+        $analysis['expected_price'] = round((float) $expectedPrice, 2);
+        $analysis['currency'] = 'RWF';
+        $analysis['item_breakdown'] = $itemBreakdown;
+
+        $analysis['detected_item'] = $detectedNames ?: ($analysis['detected_item'] ?? 'E-Waste Item');
+        $analysis['detected_category_id'] = $category?->id;
+        $analysis['detected_category_name'] = $category?->name ?? ($analysis['detected_category_name'] ?? null);
+        $analysis['waste_nature'] = $category?->waste_nature ?? ($analysis['waste_nature'] ?? 'ibitabora');
+        $analysis['is_hazardous'] = (bool) ($category?->is_hazardous ?? ($analysis['is_hazardous'] ?? false));
+
+        if ($loadType === 'bulk_pile') {
+            $analysis['is_hazardous'] = true;
+        }
+
+        if (empty($analysis['title'])) {
+            $analysis['title'] = $loadType === 'bulk_pile'
+                ? 'Bulk Mixed E-Waste Collection'
+                : ($analysis['detected_item'] ?? $request->input('title') ?? $request->input('name') ?? 'E-Waste Listing');
+        }
+
+        if (empty($analysis['description'])) {
+            $analysis['description'] = $analysis['analysis_note'] ?? 'Electronic waste item prepared for collection and recycling.';
+        }
+
+        if (empty($analysis['analysis_note'])) {
+            $analysis['analysis_note'] = $loadType === 'bulk_pile'
+                ? 'AI detected multiple e-waste items from the photo and matched each item with the standard category library. Final weight must be verified by staff.'
+                : 'AI detected the e-waste item and matched it with the standard category library. Staff verification is recommended.';
+        }
+
+        return [
+            'category' => $category,
+            'ai_result' => $this->sanitizeAiResult($analysis),
+        ];
+    }
+
+    private function generateGeminiListingAnalysis(Request $request, $categories): ?array
+    {
+        if (!$this->getGeminiUseAi() || !$this->getGeminiApiKey()) {
+            return null;
+        }
+
+        $categoryList = $categories
+            ->map(function (WasteCategory $category) {
+                return [
+                    'id' => $category->id,
+                    'name' => $category->name,
+                    'slug' => $category->slug,
+                    'waste_nature' => $category->waste_nature,
+                    'is_hazardous' => (bool) $category->is_hazardous,
+                    'average_weight_kg' => $category->average_weight_kg,
+                    'min_weight_kg' => $category->min_weight_kg,
+                    'max_weight_kg' => $category->max_weight_kg,
+                    'price_per_kg' => $category->price_per_kg,
+                    'price_per_item' => $category->price_per_item,
+                ];
+            })
+            ->values()
+            ->toArray();
+
+        $categoriesJson = json_encode($categoryList, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        $name = trim((string) $request->input('name', ''));
+        $title = trim((string) $request->input('title', ''));
+        $description = trim((string) $request->input('description', ''));
+        $quantity = (int) $request->input('quantity', 1);
+
+        $prompt = <<<PROMPT
+You are the e-waste listing engine for a recycling platform in Rwanda.
+
+Your main job:
+Analyze the uploaded image and list EVERY visible e-waste item/component separately.
+
+Return ONLY raw JSON.
+No markdown.
+No code fences.
+No explanations.
+
+Use this exact JSON structure:
+{
+  "detected_item": "string",
+  "title": "string",
+  "description": "string",
+  "detected_category_id": null,
+  "detected_category_name": "string",
+  "waste_nature": "ibitabora",
+  "is_e_waste": true,
+  "is_hazardous": false,
+  "quantity": 1,
+  "estimated_weight_kg": 0,
+  "expected_price": 0,
+  "currency": "RWF",
+  "confidence": 80,
+  "condition": "used",
+  "load_type": "single_item",
+  "item_breakdown": [
+    {
+      "item_name": "string",
+      "category_name": "string",
+      "quantity": 1,
+      "unit_weight_kg": 0,
+      "total_weight_kg": 0,
+      "confidence": 80,
+      "reason": "string"
+    }
+  ],
+  "analysis_note": "string"
+}
+
+Critical rules:
+- If an image is uploaded, inspect the image carefully.
+- List every visible e-waste type separately in item_breakdown.
+- Example: if photo has 4 monitors, 2 CPU towers, 1 keyboard, and cables, item_breakdown must have separate rows.
+- Do not return only "mixed e-waste" when individual items are visible.
+- Use category_name that is closest to one of the provided category names.
+- The Laravel backend will match your item rows to the category library and calculate final kg/price.
+- Count approximately when exact count is hard.
+- If an item cannot be counted exactly, use a batch row such as "Cable Batch" or "Mixed Small Electronic Parts Batch".
+- For large piles, set load_type to "bulk_pile".
+- For one clear item, set load_type to "single_item".
+- estimated_weight_kg must equal the approximate sum of item_breakdown.total_weight_kg.
+- expected_price is only preliminary.
+- Always mention staff verification in analysis_note.
+
+Reference weights if unsure:
+- Laptop: 2.5 kg
+- LCD Monitor: 4 kg
+- CRT Monitor: 15 kg
+- Desktop CPU Tower: 8 kg
+- Keyboard: 0.8 kg
+- Mouse: 0.2 kg
+- Small Printer: 8 kg
+- Large Printer / Copier: 20 kg
+- UPS: 7 kg
+- Small Battery: 1.2 kg
+- Large Battery: 10 kg
+- Cable Batch: 5 kg
+- Mixed Small Electronic Parts Batch: 8 kg
+- Mixed E-Waste Bulk Pile: 150 kg or more
+
+Available category library:
+{$categoriesJson}
+
+User name: {$name}
+User title: {$title}
+User description: {$description}
+Quantity: {$quantity}
+PROMPT;
+
+        $parts = [
+            ['text' => $prompt],
+        ];
+
+        if ($request->hasFile('image')) {
+            $image = $request->file('image');
+
+            $parts[] = [
+                'inline_data' => [
+                    'mime_type' => $image->getMimeType(),
+                    'data' => base64_encode(file_get_contents($image->getRealPath())),
+                ],
+            ];
+        }
+
+        $model = $this->getGeminiModel();
+        $apiKey = $this->getGeminiApiKey();
+
+        $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
+
+        $response = Http::timeout(60)->post($url, [
+            'contents' => [
+                [
+                    'role' => 'user',
+                    'parts' => $parts,
+                ],
+            ],
+            'generationConfig' => [
+                'temperature' => $this->getGeminiTemperature(),
+                'maxOutputTokens' => $this->getGeminiMaxOutputTokens(),
+                'responseMimeType' => 'application/json',
+            ],
+        ]);
+
+        if (!$response->successful()) {
+            Log::warning('Gemini waste listing image analysis failed', [
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return null;
+        }
+
+        $text = data_get($response->json(), 'candidates.0.content.parts.0.text');
+
+        if (!is_string($text) || trim($text) === '') {
+            return null;
+        }
+
+        return $this->decodeGeminiJson($text);
+    }
+
+    private function normalizeItemBreakdownFromCategories(array $analysis, $categories): array
+    {
+        $items = $analysis['item_breakdown'] ?? [];
+
+        if (!is_array($items)) {
+            return [];
+        }
+
+        $cleanItems = [];
+
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+
+            $itemName = trim((string) ($item['item_name'] ?? ''));
+
+            if ($itemName === '') {
+                continue;
+            }
+
+            $aiCategoryName = trim((string) ($item['category_name'] ?? ''));
+            $category = $this->matchItemCategory($itemName, $aiCategoryName, $categories);
+
+            $quantity = max((int) ($item['quantity'] ?? 1), 1);
+
+            $unitWeight = $category && $category->average_weight_kg
+                ? (float) $category->average_weight_kg
+                : $this->numberOrNull($item['unit_weight_kg'] ?? null);
+
+            if (!$unitWeight || $unitWeight <= 0) {
+                $unitWeight = $this->defaultUnitWeight($itemName);
+            }
+
+            $totalWeight = $quantity * $unitWeight;
+
+            $pricePerKg = $this->numberOrNull($category?->price_per_kg) ?: 0;
+            $pricePerItem = $this->numberOrNull($category?->price_per_item) ?: 0;
+
+            $lineExpectedPrice = $pricePerKg > 0
+                ? $totalWeight * $pricePerKg
+                : ($pricePerItem > 0 ? $quantity * $pricePerItem : $totalWeight * 700);
+
+            $cleanItems[] = [
+                'item_name' => $itemName,
+                'category_id' => $category?->id,
+                'category_name' => $category?->name ?? ($aiCategoryName ?: $itemName),
+                'category_slug' => $category?->slug,
+                'quantity' => $quantity,
+                'unit_weight_kg' => round($unitWeight, 2),
+                'total_weight_kg' => round($totalWeight, 2),
+                'min_weight_kg' => $this->numberOrNull($category?->min_weight_kg),
+                'max_weight_kg' => $this->numberOrNull($category?->max_weight_kg),
+                'price_per_kg' => $pricePerKg,
+                'price_per_item' => $pricePerItem,
+                'line_expected_price' => round($lineExpectedPrice, 2),
+                'is_hazardous' => (bool) ($category?->is_hazardous ?? false),
+                'confidence' => min(max((float) ($item['confidence'] ?? 70), 0), 100),
+                'reason' => (string) ($item['reason'] ?? 'Matched with standard e-waste category library.'),
+            ];
+        }
+
+        return $cleanItems;
+    }
+
+    private function fallbackBreakdownFromCategories(array $analysis, $categories, string $loadType, bool $hasImage): array
+    {
+        if ($loadType === 'bulk_pile') {
+            $fallbackNames = [
+                ['Visible monitors and screens', 'LCD Monitor', 4],
+                ['Desktop CPU and electronic boxes', 'Desktop CPU Tower', 4],
+                ['Printer and copier parts', 'Small Printer', 3],
+                ['Cable and small parts batch', 'Cable Batch', 4],
+                ['Mixed plastic electronic parts batch', 'Mixed Small Electronic Parts Batch', 5],
+            ];
+
+            $items = [];
+
+            foreach ($fallbackNames as [$itemName, $categoryName, $quantity]) {
+                $category = $this->matchItemCategory($itemName, $categoryName, $categories);
+                $unitWeight = $category && $category->average_weight_kg
+                    ? (float) $category->average_weight_kg
+                    : $this->defaultUnitWeight($categoryName);
+
+                $totalWeight = $quantity * $unitWeight;
+                $pricePerKg = $this->numberOrNull($category?->price_per_kg) ?: 700;
+                $pricePerItem = $this->numberOrNull($category?->price_per_item) ?: 0;
+
+                $items[] = [
+                    'item_name' => $itemName,
+                    'category_id' => $category?->id,
+                    'category_name' => $category?->name ?? $categoryName,
+                    'category_slug' => $category?->slug,
+                    'quantity' => $quantity,
+                    'unit_weight_kg' => round($unitWeight, 2),
+                    'total_weight_kg' => round($totalWeight, 2),
+                    'min_weight_kg' => $this->numberOrNull($category?->min_weight_kg),
+                    'max_weight_kg' => $this->numberOrNull($category?->max_weight_kg),
+                    'price_per_kg' => $pricePerKg,
+                    'price_per_item' => $pricePerItem,
+                    'line_expected_price' => round($totalWeight * $pricePerKg, 2),
+                    'is_hazardous' => (bool) ($category?->is_hazardous ?? false),
+                    'confidence' => 50,
+                    'reason' => 'Fallback estimate from visible bulk image. Staff verification required.',
+                ];
+            }
+
+            return $items;
+        }
+
+        $itemName = (string) (
+            $analysis['detected_item']
+            ?? $analysis['title']
+            ?? 'E-Waste Item'
+        );
+
+        $category = $this->matchItemCategory($itemName, (string) ($analysis['detected_category_name'] ?? ''), $categories);
+        $quantity = max((int) ($analysis['quantity'] ?? 1), 1);
+        $unitWeight = $category && $category->average_weight_kg
+            ? (float) $category->average_weight_kg
+            : $this->defaultUnitWeight($itemName);
+
+        $totalWeight = $quantity * $unitWeight;
+        $pricePerKg = $this->numberOrNull($category?->price_per_kg) ?: 700;
+        $pricePerItem = $this->numberOrNull($category?->price_per_item) ?: 0;
+
+        return [
+            [
+                'item_name' => $itemName,
+                'category_id' => $category?->id,
+                'category_name' => $category?->name ?? $itemName,
+                'category_slug' => $category?->slug,
+                'quantity' => $quantity,
+                'unit_weight_kg' => round($unitWeight, 2),
+                'total_weight_kg' => round($totalWeight, 2),
+                'min_weight_kg' => $this->numberOrNull($category?->min_weight_kg),
+                'max_weight_kg' => $this->numberOrNull($category?->max_weight_kg),
+                'price_per_kg' => $pricePerKg,
+                'price_per_item' => $pricePerItem,
+                'line_expected_price' => round($pricePerKg > 0 ? $totalWeight * $pricePerKg : $quantity * $pricePerItem, 2),
+                'is_hazardous' => (bool) ($category?->is_hazardous ?? false),
+                'confidence' => $hasImage ? 60 : 70,
+                'reason' => 'Matched with standard e-waste category library.',
+            ],
+        ];
+    }
+
+    private function matchItemCategory(string $itemName, string $categoryName, $categories): ?WasteCategory
+    {
+        $item = strtolower(trim($itemName));
+        $cat = strtolower(trim($categoryName));
+
+        foreach ($categories as $category) {
+            $name = strtolower((string) $category->name);
+            $slug = strtolower((string) $category->slug);
+
+            if ($cat !== '' && ($cat === $name || $cat === $slug || str_contains($name, $cat) || str_contains($cat, $name))) {
+                return $category;
+            }
+
+            if ($item !== '' && ($item === $name || str_contains($item, $name) || str_contains($name, $item))) {
+                return $category;
+            }
+        }
+
+        $aliases = [
+            'cpu' => ['desktop_cpu_tower', 'desktop cpu tower'],
+            'tower' => ['desktop_cpu_tower', 'desktop cpu tower'],
+            'desktop' => ['desktop_cpu_tower', 'desktop cpu tower'],
+            'lcd' => ['lcd_monitor', 'lcd monitor'],
+            'screen' => ['lcd_monitor', 'lcd monitor'],
+            'crt' => ['crt_monitor', 'crt monitor'],
+            'keyboard' => ['keyboard'],
+            'mouse' => ['mouse'],
+            'printer' => ['small_printer', 'small printer'],
+            'copier' => ['large_printer_copier', 'large printer / copier'],
+            'ups' => ['ups'],
+            'battery' => ['small_battery', 'small battery'],
+            'cable' => ['cable_batch', 'cable batch'],
+            'motherboard' => ['motherboard'],
+            'circuit' => ['circuit_board_batch', 'circuit board batch'],
+            'phone' => ['mobile_phone', 'mobile phone'],
+            'tablet' => ['tablet'],
+            'router' => ['network_router', 'network router'],
+            'switch' => ['network_switch', 'network switch'],
+        ];
+
+        $combined = "{$item} {$cat}";
+
+        foreach ($aliases as $keyword => $targets) {
+            if (!str_contains($combined, $keyword)) {
+                continue;
+            }
+
+            foreach ($categories as $category) {
+                $name = strtolower((string) $category->name);
+                $slug = strtolower((string) $category->slug);
+
+                foreach ($targets as $target) {
+                    if ($slug === $target || $name === $target || str_contains($slug, str_replace(' ', '_', $target))) {
+                        return $category;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function selectListingCategory(Request $request, array $analysis, array $itemBreakdown, $categories): ?WasteCategory
+    {
+        if ($this->isNoWasteAnalysis($analysis)) {
+            return null;
+        }
+
+        if ($request->filled('waste_category_id')) {
+            return WasteCategory::find($request->input('waste_category_id'));
+        }
+
+        $loadType = (string) ($analysis['load_type'] ?? 'single_item');
+
+        if ($loadType === 'bulk_pile') {
+            $bulkCategory = $this->findBulkCategory($categories);
+
+            if ($bulkCategory) {
+                return $bulkCategory;
+            }
+        }
+
+        $topItem = collect($itemBreakdown)
+            ->sortByDesc(fn ($item) => (float) ($item['total_weight_kg'] ?? 0))
+            ->first();
+
+        if ($topItem && !empty($topItem['category_id'])) {
+            return WasteCategory::find($topItem['category_id']);
+        }
+
+        return $this->matchCategory($request, $analysis, $categories);
+    }
+
+    private function matchCategory(Request $request, array $analysis, $categories): ?WasteCategory
+    {
+        if ($this->isNoWasteAnalysis($analysis)) {
+            return null;
+        }
+
+        if ($request->filled('waste_category_id')) {
+            return WasteCategory::find($request->input('waste_category_id'));
+        }
+
+        if (!empty($analysis['detected_category_id'])) {
+            $category = WasteCategory::find($analysis['detected_category_id']);
+
+            if ($category) {
+                return $category;
+            }
+        }
+
+        $categoryName = strtolower((string) ($analysis['detected_category_name'] ?? ''));
+        $itemName = strtolower((string) ($analysis['detected_item'] ?? ''));
+
+        return $this->matchItemCategory($itemName, $categoryName, $categories);
+    }
+
+    private function findBulkCategory($categories): ?WasteCategory
+    {
+        $keywords = [
+            'mixed_e_waste_bulk_pile',
+            'mixed',
+            'bulk',
+            'general',
+            'electronic',
+            'electronics',
+            'e-waste',
+            'ewaste',
+            'waste',
+        ];
+
+        foreach ($categories as $category) {
+            $name = strtolower((string) $category->name);
+            $slug = strtolower((string) $category->slug);
+
+            foreach ($keywords as $keyword) {
+                if (str_contains($name, $keyword) || str_contains($slug, $keyword)) {
+                    return $category;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function calculateExpectedPrice(
+        WasteCategory $category,
+        int $quantity,
+        mixed $estimatedWeight,
+        string $loadType = 'single_item'
+    ): float {
+        $weight = (float) ($estimatedWeight ?: 0);
+
+        if ((float) $category->price_per_kg > 0 && $weight > 0) {
+            return round($weight * (float) $category->price_per_kg, 2);
+        }
+
+        if ((float) $category->price_per_item > 0) {
+            return round($quantity * (float) $category->price_per_item, 2);
+        }
+
+        return 0;
+    }
+
+    private function sumBreakdownWeight(array $items): float
+    {
+        return round(array_reduce($items, function ($total, $item) {
+            return $total + (float) ($item['total_weight_kg'] ?? 0);
+        }, 0), 2);
+    }
+
+    private function sumBreakdownPrice(array $items): float
+    {
+        return round(array_reduce($items, function ($total, $item) {
+            return $total + (float) ($item['line_expected_price'] ?? 0);
+        }, 0), 2);
+    }
+
+    private function fallbackListingAnalysis(string $name, bool $hasImage = false): array
+    {
+        $name = trim($name);
+
+        if ($name === '' && $hasImage) {
+            return [
+                'detected_item' => 'Mixed electronic waste pile',
+                'title' => 'Bulk Mixed E-Waste Collection',
+                'description' => 'Large mixed electronic waste collection prepared for sorting, weighing, and recycling.',
+                'detected_category_id' => null,
+                'detected_category_name' => 'Mixed E-Waste Bulk Pile',
+                'waste_nature' => 'ibitabora',
+                'is_e_waste' => true,
+                'is_hazardous' => true,
+                'quantity' => 1,
+                'estimated_weight_kg' => 154,
+                'expected_price' => 107800,
+                'currency' => 'RWF',
+                'confidence' => 60,
+                'condition' => 'mixed damaged electronics',
+                'load_type' => 'bulk_pile',
+                'item_breakdown' => [],
+                'analysis_note' => 'Fallback estimate for uploaded image. Staff must verify the final weight.',
+            ];
+        }
+
+        if ($name === '') {
+            $name = 'E-Waste Item';
+        }
+
+        return [
+            'detected_item' => $name,
+            'title' => $name,
+            'description' => 'Electronic waste item prepared for sorting, collection, and recycling.',
+            'detected_category_id' => null,
+            'detected_category_name' => null,
+            'waste_nature' => 'ibitabora',
+            'is_e_waste' => true,
+            'is_hazardous' => false,
+            'quantity' => 1,
+            'estimated_weight_kg' => 2,
+            'expected_price' => 1500,
+            'currency' => 'RWF',
+            'confidence' => 60,
+            'condition' => 'used',
+            'load_type' => 'single_item',
+            'item_breakdown' => [],
+            'analysis_note' => 'Fallback AI estimate generated from item name.',
+        ];
+    }
+
+    private function detectLoadType(array $analysis, Request $request): string
+    {
+        $loadType = strtolower((string) ($analysis['load_type'] ?? ''));
+
+        if ($loadType === 'bulk_pile') {
+            return 'bulk_pile';
+        }
+
+        $combinedText = strtolower(implode(' ', [
+            (string) ($analysis['detected_item'] ?? ''),
+            (string) ($analysis['title'] ?? ''),
+            (string) ($analysis['description'] ?? ''),
+            (string) ($analysis['detected_category_name'] ?? ''),
+            (string) ($analysis['analysis_note'] ?? ''),
+            (string) $request->input('name', ''),
+            (string) $request->input('title', ''),
+            (string) $request->input('description', ''),
+        ]));
+
+        $bulkKeywords = [
+            'pile',
+            'heap',
+            'bulk',
+            'mixed',
+            'truckload',
+            'truck load',
+            'large collection',
+            'warehouse',
+            'room full',
+            'many items',
+            'multiple devices',
+            'scrap pile',
+            'e-waste pile',
+            'electronic waste pile',
+        ];
+
+        foreach ($bulkKeywords as $keyword) {
+            if (str_contains($combinedText, $keyword)) {
+                return 'bulk_pile';
+            }
+        }
+
+        $estimatedWeight = $this->numberOrNull($analysis['estimated_weight_kg'] ?? null);
+
+        if ($estimatedWeight && $estimatedWeight >= 50) {
+            return 'bulk_pile';
+        }
+
+        return 'single_item';
+    }
+
+    private function sanitizeAiResult(array $analysis): array
+    {
+        $wasteNature = $analysis['waste_nature'] ?? 'ibitabora';
+
+        if (!in_array($wasteNature, ['ibibora', 'ibitabora'], true)) {
+            $wasteNature = 'ibitabora';
+        }
+
+        $loadType = (string) ($analysis['load_type'] ?? 'single_item');
+        $estimatedWeight = $this->numberOrNull($analysis['estimated_weight_kg'] ?? null);
+        $expectedPrice = $this->numberOrNull($analysis['expected_price'] ?? null);
+        $itemBreakdown = is_array($analysis['item_breakdown'] ?? null)
+            ? $analysis['item_breakdown']
+            : [];
+
+        if ($loadType === 'bulk_pile' && (!$estimatedWeight || $estimatedWeight < 50)) {
+            $estimatedWeight = 150;
+        }
+
+        if ($expectedPrice === null) {
+            $expectedPrice = $loadType === 'bulk_pile'
+                ? ((float) ($estimatedWeight ?: 150) * 700)
+                : 0;
+        }
+
+        return [
+            'detected_item' => (string) ($analysis['detected_item'] ?? 'E-Waste Item'),
+            'title' => (string) ($analysis['title'] ?? $analysis['detected_item'] ?? 'E-Waste Listing'),
+            'description' => (string) ($analysis['description'] ?? ''),
+            'detected_category_id' => $analysis['detected_category_id'] ?? null,
+            'detected_category_name' => $analysis['detected_category_name'] ?? null,
+            'waste_nature' => $wasteNature,
+            'is_e_waste' => (bool) ($analysis['is_e_waste'] ?? true),
+            'is_hazardous' => (bool) ($analysis['is_hazardous'] ?? false),
+            'quantity' => $loadType === 'no_waste'
+                ? 0
+                : max((int) ($analysis['quantity'] ?? 1), 1),
+            'estimated_weight_kg' => round((float) $estimatedWeight, 2),
+            'expected_price' => round((float) $expectedPrice, 2),
+            'currency' => 'RWF',
+            'confidence' => min(max((float) ($analysis['confidence'] ?? 70), 0), 100),
+            'condition' => (string) ($analysis['condition'] ?? 'used'),
+            'load_type' => $loadType,
+            'item_breakdown' => $itemBreakdown,
+            'analysis_note' => (string) ($analysis['analysis_note'] ?? ''),
+        ];
+    }
+
+    private function isNoWasteAnalysis(array $analysis): bool
+    {
+        $loadType = strtolower((string) ($analysis['load_type'] ?? ''));
+        $detectedItem = strtolower((string) ($analysis['detected_item'] ?? ''));
+        $title = strtolower((string) ($analysis['title'] ?? ''));
+        $categoryName = strtolower((string) ($analysis['detected_category_name'] ?? ''));
+        $description = strtolower((string) ($analysis['description'] ?? ''));
+        $note = strtolower((string) ($analysis['analysis_note'] ?? ''));
+
+        if ($loadType === 'no_waste') {
+            return true;
+        }
+
+        if (array_key_exists('is_e_waste', $analysis) && filter_var($analysis['is_e_waste'], FILTER_VALIDATE_BOOLEAN) === false) {
+            return true;
+        }
+
+        $combined = "{$detectedItem} {$title} {$categoryName} {$description} {$note}";
+
+        return str_contains($combined, 'no e-waste')
+            || str_contains($combined, 'no ewaste')
+            || str_contains($combined, 'no electronic waste')
+            || str_contains($combined, 'does not contain visible e-waste')
+            || str_contains($combined, 'no visible e-waste');
+    }
+
+    private function defaultUnitWeight(string $itemName): float
+    {
+        $name = strtolower($itemName);
+
+        if (str_contains($name, 'crt')) {
+            return 15;
+        }
+
+        if (str_contains($name, 'lcd monitor')) {
+            return 4;
+        }
+
+        if (str_contains($name, 'monitor') || str_contains($name, 'screen')) {
+            return 4;
+        }
+
+        if (str_contains($name, 'laptop')) {
+            return 2.5;
+        }
+
+        if (str_contains($name, 'cpu') || str_contains($name, 'tower') || str_contains($name, 'desktop')) {
+            return 8;
+        }
+
+        if (str_contains($name, 'keyboard')) {
+            return 0.8;
+        }
+
+        if (str_contains($name, 'mouse')) {
+            return 0.2;
+        }
+
+        if (str_contains($name, 'large printer') || str_contains($name, 'copier')) {
+            return 20;
+        }
+
+        if (str_contains($name, 'printer')) {
+            return 8;
+        }
+
+        if (str_contains($name, 'ups')) {
+            return 7;
+        }
+
+        if (str_contains($name, 'large battery')) {
+            return 10;
+        }
+
+        if (str_contains($name, 'battery')) {
+            return 1.2;
+        }
+
+        if (str_contains($name, 'cable')) {
+            return 5;
+        }
+
+        if (str_contains($name, 'batch') || str_contains($name, 'parts')) {
+            return 8;
+        }
+
+        return 2;
+    }
+
+    private function decodeGeminiJson(string $text): ?array
+    {
+        $text = trim($text);
+
+        $text = preg_replace('/^```json\s*/i', '', $text);
+        $text = preg_replace('/^```\s*/i', '', $text);
+        $text = preg_replace('/\s*```$/', '', $text);
+
+        $decoded = json_decode($text, true);
+
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        $start = strpos($text, '{');
+        $end = strrpos($text, '}');
+
+        if ($start !== false && $end !== false && $end > $start) {
+            $jsonOnly = substr($text, $start, $end - $start + 1);
+            $decoded = json_decode($jsonOnly, true);
+
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        return null;
+    }
+
+    private function numberOrNull(mixed $value): ?float
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (!is_numeric($value)) {
+            return null;
+        }
+
+        return (float) $value;
+    }
+
+    private function getGeminiApiKey(): ?string
+    {
+        return config('services.gemini.api_key') ?: env('GEMINI_API_KEY');
+    }
+
+    private function getGeminiModel(): string
+    {
+        return config('services.gemini.model') ?: env('GEMINI_MODEL', 'gemini-2.5-flash');
+    }
+
+    private function getGeminiTemperature(): float
+    {
+        return (float) (config('services.gemini.temperature') ?: env('GEMINI_TEMPERATURE', 0.3));
+    }
+
+    private function getGeminiMaxOutputTokens(): int
+    {
+        return (int) (config('services.gemini.max_output_tokens') ?: env('GEMINI_MAX_OUTPUT_TOKENS', 800));
+    }
+
+    private function getGeminiUseAi(): bool
+    {
+        $value = config('services.gemini.use_ai');
+
+        if ($value === null) {
+            $value = env('GEMINI_USE_AI', false);
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
+}
