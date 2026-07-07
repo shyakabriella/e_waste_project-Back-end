@@ -25,6 +25,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\API\DriverPickupController;
 use App\Http\Controllers\API\DeepWasteListingController;
 use App\Http\Controllers\API\LocalWasteVisionController;
+use App\Http\Controllers\API\GeminiStatusController;
 
 /*
 |--------------------------------------------------------------------------
@@ -168,3 +169,5 @@ Route::prefix('driver')->middleware('auth:sanctum')->group(function () {
 Route::post('waste-listings/deep-ai-preview', [DeepWasteListingController::class, 'deepAiPreview'])->middleware('auth:sanctum');
 
 Route::post('waste-listings/local-ai-preview', [LocalWasteVisionController::class, 'localAiPreview'])->middleware('auth:sanctum');
+
+Route::get('ai/gemini-status', [GeminiStatusController::class, 'status'])->middleware('auth:sanctum');

@@ -241,24 +241,12 @@ class LocalEwasteVisionService
             'is_e_waste' => count($itemBreakdown) > 0,
             'is_hazardous' => $isHazardous,
             'quantity' => $totalQty,
-            'estimated_weight_kg' => $quotationMode === 'range_only'
-                ? round(($minWeight + $maxWeight) / 2, 2)
-                : round($avgWeight, 2),
-            'suggested_estimated_weight_kg' => round($avgWeight, 2),
+            'estimated_weight_kg' => round($avgWeight, 2),
             'estimated_weight_min_kg' => round($minWeight, 2),
             'estimated_weight_max_kg' => round($maxWeight, 2),
-            'display_weight_text' => $quotationMode === 'range_only'
-                ? $this->formatKg($minWeight) . ' – ' . $this->formatKg($maxWeight)
-                : $this->formatKg($avgWeight),
-            'expected_price' => $quotationMode === 'range_only'
-                ? round(($priceMin + $priceMax) / 2)
-                : round($priceAvg),
-            'suggested_expected_price' => round($priceAvg),
+            'expected_price' => round($priceAvg),
             'expected_price_min' => round($priceMin),
             'expected_price_max' => round($priceMax),
-            'display_price_text' => $quotationMode === 'range_only'
-                ? $this->formatMoney($priceMin) . ' – ' . $this->formatMoney($priceMax)
-                : $this->formatMoney($priceAvg),
             'price_per_kg' => (float) env('E_WASTE_DEFAULT_PRICE_PER_KG', 700),
             'currency' => 'RWF',
             'confidence' => round($confidence, 2),
@@ -320,18 +308,6 @@ class LocalEwasteVisionService
             'source' => 'local_vision',
             'reason' => 'Detected class is not configured in ewaste_items table.',
         ];
-    }
-
-    private function formatKg(float $value): string
-    {
-        $value = round($value, 1);
-
-        return rtrim(rtrim((string) $value, '0'), '.') . ' kg';
-    }
-
-    private function formatMoney(float $value): string
-    {
-        return 'RWF ' . number_format((float) round($value));
     }
 
     private function normalizeClassName(string $className): string
